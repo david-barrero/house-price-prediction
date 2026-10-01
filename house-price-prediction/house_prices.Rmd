@@ -1,0 +1,260 @@
+---
+title: "Predicting Home Prices in Ames, Iowa"
+subtitle: "Does the best-fitting model make the best predictions?"
+author: "David Barrero"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)   # data wrangling and plots
+library(here)        # project-relative file paths
+library(glmnet)      # lasso and ridge
+library(scales)      # axis labels
+library(knitr)       # tables
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(plot.title.position = "plot",
+                  panel.grid.minor = element_blank()))
+
+col_main  <- "#1F4E79"
+col_light <- "#9DB9D3"
+col_high  <- "#C8102E"
+```
+
+## The question
+
+The goal of this project is to predict the sale price of homes in Ames, Iowa. I built five regression models using different strategies, ranked them by how well they fit the data, and then tested how well each one actually predicts prices for homes it has never seen. I also compared them to lasso and ridge regression. The main question is whether the model that fits the training data best is also the one that predicts new homes best.
+
+## Data
+
+```{r load}
+train <- read_csv(here("data", "house_price_train.csv"), col_select = -1)
+test  <- read_csv(here("data", "house_price_test.csv"),  col_select = -1)
+```
+
+The data comes from the Ames Housing dataset, a public dataset of residential home sales in Ames, Iowa. It is split into a training set of `r comma(nrow(train))` homes, used to fit the models, and a test set of `r comma(nrow(test))` homes, used only to check predictions. Each home has `r ncol(train) - 2` features covering the lot, neighborhood, size, quality, age, rooms, basement, and garage. The median home in the training set sold for `r dollar(median(train$SalePrice))`.
+
+```{r price-dist, fig.height = 3.5}
+ggplot(train, aes(SalePrice)) +
+  geom_histogram(bins = 40, fill = col_main) +
+  scale_x_continuous(labels = dollar) +
+  labs(title = "Sale prices in the training set", x = "Sale price", y = "Homes")
+```
+
+## Five candidate models
+
+Each model takes a different approach to choosing variables.
+
+```{r models}
+formulas <- list(
+  # Model 1: a small set of sale, building, garage, kitchen, and lot features
+  "Model 1" = SalePrice ~ SaleCondition + BldgType + GarageCars:GarageArea +
+    KitchenQual + LotArea + I(LotArea^2) + OverallQual:OverallCond,
+
+  # Model 2 ("kitchen sink"): almost every available variable
+  "Model 2" = SalePrice ~ MSSubClass + MSZoning + LotArea + Street + LotShape +
+    LandContour + Utilities + LotConfig + LandSlope + Neighborhood + Condition1 +
+    BldgType + HouseStyle + OverallQual + OverallCond + YearBuilt + YearRemodAdd +
+    ExterQual + ExterCond + BsmtFinSF1 + BsmtUnfSF + TotalBsmtSF + HeatingQC +
+    CentralAir + X1stFlrSF + X2ndFlrSF + LowQualFinSF + BsmtFullBath + BsmtHalfBath +
+    FullBath + HalfBath + BedroomAbvGr + KitchenAbvGr + KitchenQual + TotRmsAbvGrd +
+    Functional + Foundation + Fireplaces + GarageCars + GarageArea,
+
+  # Model 3: categorical and count variables only, with interactions
+  "Model 3" = SalePrice ~ MSZoning + Street + LotShape:LotConfig + LandContour:LandSlope +
+    Neighborhood + Condition1 + BldgType + HouseStyle + OverallQual:OverallCond +
+    YearBuilt:YearRemodAdd + ExterQual:ExterCond + Foundation + HeatingQC + CentralAir +
+    BsmtFullBath:BsmtHalfBath + FullBath:HalfBath + BedroomAbvGr + KitchenAbvGr +
+    KitchenQual + TotRmsAbvGrd + Functional + Fireplaces + GarageCars,
+
+  # Model 4: my own pick, a mix of size, location, quality, and rooms with
+  # curved (squared and cubed) living area
+  "Model 4" = SalePrice ~ MSSubClass + LotArea + I(LotArea^2) + Neighborhood +
+    OverallQual:OverallCond + TotalBsmtSF + ExterQual + GrLivArea + I(GrLivArea^2) +
+    I(GrLivArea^3) + BsmtFullBath + BsmtHalfBath + FullBath + HalfBath + TotRmsAbvGrd +
+    Fireplaces + GarageCars:GarageArea,
+
+  # Model 5: as few variables as possible, focused on size
+  "Model 5" = SalePrice ~ LotArea + I(LotArea^2) + I(LotArea^3) + TotalBsmtSF +
+    I(TotalBsmtSF^2) + GrLivArea + I(GrLivArea^2) + I(GrLivArea^3) +
+    BsmtFullBath + BsmtHalfBath + FullBath + HalfBath
+)
+
+models <- map(formulas, ~ lm(.x, data = train))
+```
+
+| Model | Strategy | Coefficients |
+|---|---|---|
+| Model 1 | A handful of sale, building, garage, kitchen, and lot features | `r length(coef(models[[1]]))` |
+| Model 2 | "Kitchen sink," nearly every variable | `r length(coef(models[[2]]))` |
+| Model 3 | Only categorical and count variables, with interactions | `r length(coef(models[[3]]))` |
+| Model 4 | My own pick: size, location, quality, and rooms, with curved living area | `r length(coef(models[[4]]))` |
+| Model 5 | Smallest model, focused only on size | `r length(coef(models[[5]]))` |
+
+Before looking at any results, I expected Model 4 to do best, because it covers a little of everything without piling on variables, and Model 1 to do worst.
+
+> **A note on an earlier version.** In my original class version, squared and cubed terms were written as `I(LotArea)^2`. In an R formula that doesn't square anything, so those models were actually linear in size. Here they are written correctly as `I(LotArea^2)`, which turned out to matter a lot for Model 4.
+
+## Ranking by in-sample fit
+
+The usual way to compare regression models is by how well they fit the data they were trained on.
+
+```{r in-sample}
+rmse <- function(u) sqrt(mean(u^2))
+
+fit_stats <- imap_dfr(models, ~ tibble(
+  Model = .y,
+  `R²` = summary(.x)$r.squared,
+  `Adj. R²` = summary(.x)$adj.r.squared,
+  AIC = AIC(.x),
+  BIC = BIC(.x),
+  `Training RMSE` = rmse(resid(.x))
+))
+
+fit_stats %>%
+  mutate(across(c(`R²`, `Adj. R²`), ~ round(.x, 3)),
+         across(c(AIC, BIC), ~ comma(round(.x))),
+         `Training RMSE` = dollar(round(`Training RMSE`))) %>%
+  kable(caption = "In-sample fit on the training data (lower AIC, BIC, and RMSE are better)")
+```
+
+By most of these measures, Model 2 (the kitchen sink) looks best. It has the highest R² and adjusted R² and the lowest AIC and training error. The one exception is BIC, which penalizes extra variables more heavily and picks Model 4 instead. But all of these numbers only show how well each model explains homes it has already seen.
+
+## Ranking by real predictions
+
+To see how the models do on new homes, I used each one to predict prices for the `r comma(nrow(test))` homes in the test set. I also fit lasso and ridge regressions on the full set of variables. Both methods shrink coefficients toward zero to reduce overfitting, and lasso can drop variables entirely. The penalty for each was chosen with 10-fold cross-validation on the training data.
+
+```{r regularized}
+# Variables left out: Id, and categories that have levels in the test set
+# that never appear in the training set
+drop_vars <- c("Id", "Condition2", "RoofStyle", "RoofMatl",
+               "Exterior1st", "Exterior2nd", "Heating", "Utilities")
+
+both <- bind_rows(train = train, test = test, .id = "set") %>%
+  select(-all_of(drop_vars)) %>%
+  mutate(across(where(is.character) & !set, factor))
+
+X <- model.matrix(SalePrice ~ . - set, data = both)[, -1]
+X_train <- X[both$set == "train", ]
+X_test  <- X[both$set == "test", ]
+
+set.seed(4750)
+lasso <- cv.glmnet(X_train, train$SalePrice, alpha = 1)
+ridge <- cv.glmnet(X_train, train$SalePrice, alpha = 0)
+
+lasso_kept <- sum(coef(lasso, s = "lambda.min")[-1] != 0)
+```
+
+The lasso kept `r lasso_kept` of the `r ncol(X_train)` possible variables.
+
+```{r out-of-sample}
+preds <- c(
+  map(models, ~ predict(.x, newdata = test)),
+  list(Lasso = as.numeric(predict(lasso, X_test, s = "lambda.min")),
+       Ridge = as.numeric(predict(ridge, X_test, s = "lambda.min")))
+)
+
+train_err <- c(
+  map_dbl(models, ~ rmse(resid(.x))),
+  Lasso = rmse(train$SalePrice - predict(lasso, X_train, s = "lambda.min")),
+  Ridge = rmse(train$SalePrice - predict(ridge, X_train, s = "lambda.min"))
+)
+
+results <- imap_dfr(preds, ~ tibble(
+  Model = .y,
+  `Test RMSPE` = rmse(test$SalePrice - .x),
+  `Test MAPE` = mean(abs(test$SalePrice - .x) / test$SalePrice)
+)) %>%
+  mutate(`Training RMSE` = train_err[Model]) %>%
+  arrange(`Test RMSPE`)
+
+best <- results$Model[1]
+
+results %>%
+  mutate(`Test RMSPE` = dollar(round(`Test RMSPE`)),
+         `Training RMSE` = dollar(round(`Training RMSE`)),
+         `Test MAPE` = percent(`Test MAPE`, accuracy = 0.1)) %>%
+  select(Model, `Test RMSPE`, `Test MAPE`, `Training RMSE`) %>%
+  kable(caption = "Prediction error on the test set, best to worst. RMSPE is the typical error in dollars; MAPE is the average error as a percent of the sale price.")
+```
+
+```{r error-chart}
+results %>%
+  mutate(Model = fct_reorder(Model, `Test RMSPE`, .desc = TRUE)) %>%
+  ggplot(aes(`Test RMSPE`, Model, fill = Model == best)) +
+  geom_col() +
+  geom_text(aes(label = dollar(round(`Test RMSPE`, -2))), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c(`TRUE` = col_high, `FALSE` = col_main), guide = "none") +
+  scale_x_continuous(labels = dollar, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Typical prediction error on homes the models had never seen",
+       x = "Root mean squared prediction error", y = NULL)
+```
+
+**`r best` has the lowest prediction error**, with a typical error of `r dollar(round(results$"Test RMSPE"[1], -2))`, about `r dollar(round(results$"Test RMSPE"[2] - results$"Test RMSPE"[1], -2))` better than the next model. That's the model I expected to win before seeing any results. The kitchen sink model, which looked best on most in-sample measures, falls behind it once it has to predict new homes.
+
+The percent error (MAPE) tells a slightly different story. Lasso, ridge, and Model 2 are a bit better on that measure, all within about one percentage point of each other. RMSPE weighs large misses more heavily. Model 4's edge comes from avoiding a few big misses among homes under $300,000, where Model 2 sometimes predicts far off. On the typical home, the models are about equally accurate.
+
+## Why the best fit isn't the best predictor
+
+Every model does worse on the test homes than on the training homes, because each one was fit to the training data. The question is how much worse.
+
+```{r overfit}
+results %>%
+  select(Model, Training = `Training RMSE`, Test = `Test RMSPE`) %>%
+  pivot_longer(-Model, names_to = "Data", values_to = "error") %>%
+  mutate(Model = factor(Model, levels = results$Model),
+         Data = factor(Data, levels = c("Training", "Test"))) %>%
+  ggplot(aes(Model, error, fill = Data)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c(Training = col_light, Test = col_main)) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Training error vs. test error for each model",
+       x = NULL, y = "Typical error (RMSE)", fill = NULL)
+```
+
+```{r gap}
+gap <- results %>%
+  mutate(gap = `Test RMSPE` - `Training RMSE`)
+gap_m2 <- gap$gap[gap$Model == "Model 2"]
+gap_m4 <- gap$gap[gap$Model == "Model 4"]
+```
+
+The kitchen sink model's error grows by `r dollar(round(gap_m2, -2))` going from training to test homes, compared to `r dollar(round(gap_m4, -2))` for Model 4. With `r length(coef(models[["Model 2"]]))` coefficients, Model 2 has enough flexibility to fit quirks of the training homes that don't carry over to new ones. That's overfitting. Model 4 uses fewer variables but focuses on what matters most (location, quality, and size, with a curved relationship for living area), so its fit carries over better.
+
+## How close are the predictions?
+
+```{r pred-vs-actual, fig.height = 5}
+tibble(actual = test$SalePrice, predicted = preds[[best]]) %>%
+  ggplot(aes(actual, predicted)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+  geom_point(alpha = 0.5, color = col_main) +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  coord_equal() +
+  labs(title = paste(best, "predicted vs. actual sale price, test homes"),
+       subtitle = "Points on the dashed line are perfect predictions",
+       x = "Actual sale price", y = "Predicted sale price")
+```
+
+Most predictions fall close to the line for homes under about $400,000. Above that, the model consistently underpredicts. Only `r sum(train$SalePrice > 400000)` homes in the training data sold for more than $400,000, so the model has little to learn from at the top of the market.
+
+## Takeaways
+
+- **In-sample fit can be misleading.** R², adjusted R², and AIC all picked the kitchen sink model, but it wasn't the best at predicting new homes. Testing on held-out data is the only way to know how a model will actually perform.
+- **More variables isn't always better.** Model 4 had fewer than half the coefficients of Model 2 and had lower prediction error.
+- **The metric matters.** Model 4 wins on dollar error, but lasso and ridge are slightly better on percent error. Which model to use depends on whether avoiding big misses matters more than typical accuracy.
+- **Small coding details matter.** Writing the squared terms correctly changed which model came out on top.
+
+## Limitations
+
+- The test set has only `r nrow(test)` homes, so small differences between models could change with a different split. Cross-validating across many splits would give a more reliable ranking.
+- RMSPE is sensitive to a few large misses on expensive homes. Modeling the log of price could reduce that, but I kept prices in dollars so the errors are easy to interpret.
+- All of the models underpredict the most expensive homes because there are few of them to learn from.
+- The data covers one city, so these models wouldn't necessarily transfer to other housing markets.

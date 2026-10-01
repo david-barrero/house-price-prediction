@@ -1,0 +1,7 @@
+# R session files
+.RData
+.Rhistory
+.Rproj.user/
+
+# Knit leftovers
+*_files/
